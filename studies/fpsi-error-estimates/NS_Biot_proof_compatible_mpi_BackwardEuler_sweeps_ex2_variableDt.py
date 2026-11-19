@@ -1,0 +1,642 @@
+# This code is for the paper: ERROR ANALYSIS OF THE EXPLICIT SPLITTING SCHEME FOR
+# FLUID-POROELASTIC STRUCTURE INTERACTION PROBLEMS 
+# Yifan Wang, Apr 2026
+import os
+import sys
+import argparse
+
+# --- robust settings for macOS MPICH/OFI ---
+os.environ.setdefault("FI_PROVIDER", "tcp")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+
+from fenics import *
+import numpy as np
+import math
+from fractions import Fraction
+
+"""
+MPI (2 ranks) backward-Euler splitting for the trigonometric manufactured
+Stokes--Biot example, with temporal and spatial convergence sweeps.
+
+- NO Python multiprocessing/Pipe
+- rank 0 solves fluid; rank 1 solves Biot
+- coupling exchanged with mpi4py using BLOCKING Send/Recv (avoids OFI nonblocking progress stalls on macOS)
+- robust DOF ordering: transfer fluid velocity using a standalone VectorFunctionSpace on both ranks
+
+Run:
+  FI_PROVIDER=tcp "$CONDA_PREFIX/bin/mpiexec" -n 2 \
+    "$CONDA_PREFIX/bin/python" NS_Biot_proof_compatible_mpi_BackwardEuler_sweeps_ex2_variableDt.py
+
+Quick two-step check: append --smoke. To run one large temporal case, append
+--mode temporal --temporal-n 128. The temporal sweep ends at T=0.25 and fixes
+100 intervals per side (dx=0.01), with dt=0.05/n. Override that mesh with
+--temporal-mesh-intervals.
+
+The default run is a spatial sweep to T=1e-5 with dx=0.5/n, hence 2*n
+intervals per side, and a fixed time step of 1e-7 (100 steps per mesh).
+Alternative mesh-dependent time steps can be selected explicitly using
+    dt_target(n) = spatial_dt * (spatial_reference_n/n)**spatial_dt_power.
+The default spatial_dt_power=0 makes dt independent of n. As with any
+fixed time step, temporal error may become visible on finer meshes.
+
+Use --spatial-dt-scales 1 0.5 to repeat the spatial sweep with half-sized
+time steps and compare the errors and rates. Use --dry-run to preview mesh sizes,
+actual time steps and step counts without solving. Fine meshes can require
+many time steps; --spatial-n selects a subset of meshes and
+--spatial-final-time overrides the common final time when desired.
+Each target dt is rounded DOWN, if needed, so every run ends exactly at T.
+
+The displacement error is the sum
+of the symmetric-gradient and divergence L2 errors; the other four errors
+are final-time L2 norms. The section's P1 pore pressure is the default;
+--phi-degree 2 selects a quadratic pore-pressure space.
+
+This older example has nonzero exterior Dirichlet data and nonzero fluid
+divergence. Its behavior does not verify a theorem that assumes homogeneous
+boundary data or an incompressible exact fluid velocity.
+"""
+
+from mpi4py import MPI as pyMPI
+# Keep the application's point-to-point messages separate from any internal
+# DOLFIN/MPI traffic on COMM_WORLD.
+comm = pyMPI.COMM_WORLD.Dup()
+rank = comm.Get_rank()
+size = comm.Get_size()
+if size != 2:
+    if rank == 0:
+        print("ERROR: This script must be run with exactly 2 MPI ranks.", flush=True)
+    raise SystemExit(1)
+
+fenics_comm = MPI.comm_self  # keep FEniCS objects serial on each rank
+
+# ----------------------
+# Parameters 
+# ----------------------
+rho_f    = 1.0
+mu_f     = 1.0
+rho_b    = 1.0
+mu_b     = 1.0
+lambda_b = 1.0
+alpha    = 1.0
+C0       = 1.0
+K        = 1.0
+C_BJS    = 1.0
+
+if any(abs(value - 1.0) > 1e-14 for value in (mu_f, mu_b, lambda_b, alpha)):
+    raise ValueError("The manufactured interface fields require unit viscosities, Lamé constants and Biot coefficient")
+
+def epsilon(u):
+    return sym(nabla_grad(u))
+
+def make_fluid_data(mesh, time):
+    """Exact fluid fields, nonzero divergence and momentum forcing."""
+    x, y = SpatialCoordinate(mesh)
+    pi = np.pi
+    shape = as_vector((-3.0*x + cos(y), y + 1.0))
+    u_exact = pi*cos(pi*time)*shape
+    p_exact = exp(time)*sin(pi*x)*cos(0.5*pi*y) + 2.0*pi*cos(pi*time)
+    u_t = -pi*pi*sin(pi*time)*shape
+    g_f = -2.0*pi*cos(pi*time)
+    stress_f = 2.0*mu_f*epsilon(u_exact) - p_exact*Identity(2)
+    f_f = rho_f*u_t - div(stress_f)
+    return u_exact, p_exact, g_f, f_f
+
+
+def make_biot_data(mesh, time):
+    """Exact solid fields and sources computed from the physical stresses."""
+    x, y = SpatialCoordinate(mesh)
+    pi = np.pi
+    shape = as_vector((-3.0*x + cos(y), y + 1.0))
+    eta_exact = sin(pi*time)*shape
+    ksi_exact = pi*cos(pi*time)*shape
+    phi_exact = exp(time)*sin(pi*x)*cos(0.5*pi*y)
+    stress_p = (2.0*mu_b*epsilon(eta_exact)
+                + lambda_b*div(eta_exact)*Identity(2)
+                - alpha*phi_exact*Identity(2))
+    ksi_t = -pi*pi*sin(pi*time)*shape
+    f_e = rho_b*ksi_t - div(stress_p)
+    f_p = C0*phi_exact + alpha*div(ksi_exact) - K*div(grad(phi_exact))
+    return eta_exact, ksi_exact, phi_exact, f_e, f_p
+
+
+def exact_vector_boundary(amplitude):
+    """Rank-local JIT of the time-adjustable exterior velocity trace."""
+    return Expression(("A*(-3.0*x[0]+cos(x[1]))", "A*(x[1]+1.0)"),
+                      A=float(amplitude), degree=5, mpi_comm=fenics_comm)
+
+def print_table(title, rows, is_dt):
+    if rank != 0:
+        return
+    print("\n" + "="*170)
+    print(title)
+    print("="*170)
+    print(f"{'n':>5} {'dt':>12} {'dx':>12}" + "".join(
+        f" {name:>12} {'rate':>9}" for name in
+        ("err_eta", "err_ksi", "err_phi", "err_u", "err_p")))
+    previous = None
+    for n, dt_float, dx_float, *errors in rows:
+        step = dt_float if is_dt else dx_float
+        fields = []
+        for i, error in enumerate(errors):
+            rate = ""
+            if previous is not None and error > 0.0 and previous[1][i] > 0.0:
+                rate = f"{np.log(previous[1][i]/error)/np.log(previous[0]/step):9.4f}"
+            fields.append(f" {error:12.4e} {rate:>9}")
+        print(f"{n:5d} {dt_float:12.4e} {dx_float:12.4e}" + "".join(fields))
+        previous = step, errors
+
+def solve_case(dt_float: float, nm: int, T: float, phi_degree: int = 1):
+    """
+    Return L2 errors for u, p, ksi, phi and the elastic error for eta.
+    """
+    # broadcast to keep ranks in sync
+    dt_float, nm, T, phi_degree = comm.bcast(
+        (dt_float, nm, T, phi_degree), root=0)
+    nsteps = int(round(T/dt_float))
+    if abs(nsteps*dt_float - T) > 1e-12:
+        raise ValueError("T must be an integer multiple of dt_float")
+    if nsteps < 1:
+        raise ValueError("The solve requires at least one time step")
+    dt = Constant(dt_float)
+
+    # ----------------------
+    # Rank 0: fluid
+    # ----------------------
+    if rank == 0:
+        mesh_f = RectangleMesh(fenics_comm, Point(0.0, 0.0), Point(1.0, 1.0), nm, nm)
+        mesh_b = RectangleMesh(fenics_comm, Point(0.0, -1.0), Point(1.0, 0.0), nm, nm)
+        time_f = Constant(0.0)
+        u_D, p_D, g_f, f_f = make_fluid_data(mesh_f, time_f)
+
+        n_f = FacetNormal(mesh_f)
+        tor_f = as_vector((-n_f[1], n_f[0]))
+
+        class Right_F(SubDomain):
+            def inside(self, x, on_boundary): return on_boundary and near(x[0], 1.0)
+        class Left_F(SubDomain):
+            def inside(self, x, on_boundary): return on_boundary and near(x[0], 0.0)
+        class Top_F(SubDomain):
+            def inside(self, x, on_boundary): return on_boundary and near(x[1], 1.0)
+        class Interface_F(SubDomain):
+            def inside(self, x, on_boundary): return on_boundary and near(x[1], 0.0)
+
+        bmf_f = MeshFunction("size_t", mesh_f, mesh_f.topology().dim()-1, 0)
+        Interface_F().mark(bmf_f, 5)
+        Right_F().mark(bmf_f, 2)
+        Top_F().mark(bmf_f, 3)
+        Left_F().mark(bmf_f, 4)
+        ds_f = Measure("ds", domain=mesh_f, subdomain_data=bmf_f)
+
+        u_elem = VectorElement("CG", mesh_f.ufl_cell(), 2)
+        p_elem = FiniteElement("CG", mesh_f.ufl_cell(), 1)
+        V_f = FunctionSpace(mesh_f, MixedElement([u_elem, p_elem]))
+        u, p = TrialFunctions(V_f)
+        v, q = TestFunctions(V_f)
+
+        # Standalone velocity space for robust MPI transfer
+        Vuf0 = VectorFunctionSpace(mesh_f, "CG", 2)
+        u_send_fn = Function(Vuf0)
+
+        # Biot coupling spaces on mesh_b (to store received eta/ksi/phi)
+        eta_elem = VectorElement("CG", mesh_b.ufl_cell(), 2)
+        ksi_elem = VectorElement("CG", mesh_b.ufl_cell(), 2)
+        phi_elem = FiniteElement("CG", mesh_b.ufl_cell(), phi_degree)
+        V_b = FunctionSpace(mesh_b, MixedElement([eta_elem, ksi_elem, phi_elem]))
+        Biot_old = Function(V_b)
+        eta_old, ksi_old, phi_old = Biot_old.split(True)
+
+        NS_old = Function(V_f)
+        u_old, p_old = NS_old.split(True)
+        NS_present = Function(V_f)
+
+        # Exact, time-dependent velocity on the three exterior sides. The
+        # fluid pressure level is fixed by the natural interface traction.
+        u_bc = exact_vector_boundary(np.pi)
+        bc_f = [DirichletBC(V_f.sub(0), u_bc, bmf_f, side)
+                for side in (4, 3, 2)]
+
+        # Joint Stokes Ritz projection of the nonzero exact initial pair.
+        # The divergence constraint has g_f(0) rather than zero on its RHS.
+        a_f0 = (2.0*mu_f*inner(epsilon(u), epsilon(v))
+                - p*div(v) + q*div(u))*dx(domain=mesh_f)
+        L_f0 = (2.0*mu_f*inner(epsilon(u_D), epsilon(v))
+                - p_D*div(v) + q*div(u_D))*dx(domain=mesh_f)
+        NS_initial = Function(V_f)
+        solve(a_f0 == L_f0, NS_initial, bc_f,
+              solver_parameters={"linear_solver": "umfpack"})
+        u_initial, p_initial = NS_initial.split(True)
+        u_old.assign(u_initial)
+        p_old.assign(p_initial)
+
+        # constants
+        rhoF = Constant(rho_f)
+        muF  = Constant(mu_f)
+        Cbjs = Constant(C_BJS)
+
+        # BE fluid forms 
+        a_f = rhoF*dot(u, v)*dx \
+            + 2*dt*muF*inner(epsilon(u), epsilon(v))*dx \
+            - dt*p*div(v)*dx \
+            + dt*q*div(u)*dx \
+            + dt*dot(u, n_f)*dot(v, n_f)*ds_f(5) \
+            + dt*Cbjs*dot(u, tor_f)*dot(v, tor_f)*ds_f(5)
+
+        L_f = dt*dot(f_f, v)*dx \
+            + rhoF*dot(u_old, v)*dx \
+            + dt*g_f*q*dx \
+            + dt*Cbjs*dot(ksi_old, tor_f)*dot(v, tor_f)*ds_f(5) \
+            + dt*dot(u_old, n_f)*dot(v, n_f)*ds_f(5) \
+            - dt*phi_old*dot(v, n_f)*ds_f(5)
+
+        # The matrix is time-independent within a case: assemble it once and
+        # reuse the LU solver while reassembling only the changing right side.
+        A_f = assemble(a_f)
+        for bc in bc_f:
+            bc.apply(A_f)
+        solver_f = LUSolver(A_f, "umfpack")
+
+        # MPI buffers
+        send_u = np.zeros(u_send_fn.vector().local_size(), dtype=np.float64)
+        recv_eta = np.zeros(eta_old.vector().local_size(), dtype=np.float64)
+        recv_ksi = np.zeros(ksi_old.vector().local_size(), dtype=np.float64)
+        recv_phi = np.zeros(phi_old.vector().local_size(), dtype=np.float64)
+
+        for nstep in range(nsteps):
+            t = (nstep + 1)*dt_float
+
+            # blocking exchange: send u^n, receive (eta^n,ksi^n,phi^n)
+            u_send_fn.assign(u_old)
+            send_u[:] = u_send_fn.vector().get_local()
+            comm.Send(send_u, dest=1, tag=10)
+            comm.Recv(recv_eta, source=1, tag=20)
+            comm.Recv(recv_ksi, source=1, tag=21)
+            comm.Recv(recv_phi, source=1, tag=22)
+
+            eta_old.vector()[:] = recv_eta; eta_old.set_allow_extrapolation(True)
+            ksi_old.vector()[:] = recv_ksi; ksi_old.set_allow_extrapolation(True)
+            phi_old.vector()[:] = recv_phi; phi_old.set_allow_extrapolation(True)
+
+            time_f.assign(t)
+            u_bc.A = float(np.pi*np.cos(np.pi*t))
+
+            b_f = assemble(L_f)
+            for bc in bc_f:
+                bc.apply(b_f)
+            solver_f.solve(NS_present.vector(), b_f)
+            u_fem, p_fem = NS_present.split(True)
+
+            u_old.assign(u_fem)
+            p_old.assign(p_fem)
+
+        eu = np.sqrt(assemble(dot(u_D - u_fem, u_D - u_fem)*dx(domain=mesh_f)))
+        ep = np.sqrt(assemble((p_D - p_fem)*(p_D - p_fem)*dx(domain=mesh_f)))
+
+        # ask rank1 to send its error triple
+        comm.Send(np.array([1], dtype=np.int32), dest=1, tag=98)
+        biot_err = np.empty(3, dtype=np.float64)
+        comm.Recv(biot_err, source=1, tag=77)
+        err_eta, err_ksi, err_phi = biot_err.tolist()
+
+        return eu, ep, err_eta, err_ksi, err_phi
+
+    # ----------------------
+    # Rank 1: biot
+    # ----------------------
+    else:
+        mesh_f = RectangleMesh(fenics_comm, Point(0.0, 0.0), Point(1.0, 1.0), nm, nm)
+        mesh_b = RectangleMesh(fenics_comm, Point(0.0, -1.0), Point(1.0, 0.0), nm, nm)
+        time_b = Constant(0.0)
+        eta_D, ksi_D, phi_D, f_e, f_p = make_biot_data(mesh_b, time_b)
+
+        n_b = FacetNormal(mesh_b)
+        tor_b = as_vector((-n_b[1], n_b[0]))
+
+        class Right_B(SubDomain):
+            def inside(self, x, on_boundary): return on_boundary and near(x[0], 1.0)
+        class Left_B(SubDomain):
+            def inside(self, x, on_boundary): return on_boundary and near(x[0], 0.0)
+        class Bottom_B(SubDomain):
+            def inside(self, x, on_boundary): return on_boundary and near(x[1], -1.0)
+        class Interface_B(SubDomain):
+            def inside(self, x, on_boundary): return on_boundary and near(x[1], 0.0)
+
+        bmf_b = MeshFunction("size_t", mesh_b, mesh_b.topology().dim()-1, 0)
+        Interface_B().mark(bmf_b, 5)
+        Right_B().mark(bmf_b, 2)
+        Bottom_B().mark(bmf_b, 1)
+        Left_B().mark(bmf_b, 4)
+        ds_b = Measure("ds", domain=mesh_b, subdomain_data=bmf_b)
+
+        eta_elem = VectorElement("CG", mesh_b.ufl_cell(), 2)
+        ksi_elem = VectorElement("CG", mesh_b.ufl_cell(), 2)
+        phi_elem = FiniteElement("CG", mesh_b.ufl_cell(), phi_degree)
+        V_b = FunctionSpace(mesh_b, MixedElement([eta_elem, ksi_elem, phi_elem]))
+        eta, ksi, phi = TrialFunctions(V_b)
+        vp, zeta, psi = TestFunctions(V_b)
+
+        Biot_old = Function(V_b)
+        eta_old, ksi_old, phi_old = Biot_old.split(True)
+        Biot_present = Function(V_b)
+
+        # Standalone fluid velocity receive space must match rank0 send space
+        Vuf1 = VectorFunctionSpace(mesh_f, "CG", 2)
+        u_old = Function(Vuf1)
+
+        # Displacement and solid velocity have nonzero, time-dependent
+        # exterior traces. Pore pressure vanishes on the three outer sides.
+        eta_bc = exact_vector_boundary(0.0)
+        ksi_bc = exact_vector_boundary(np.pi)
+        zero_scalar = Constant(0.0)
+        bc_b = ([DirichletBC(V_b.sub(0), eta_bc, bmf_b, side)
+                 for side in (1, 2, 4)]
+                + [DirichletBC(V_b.sub(1), ksi_bc, bmf_b, side)
+                   for side in (1, 2, 4)]
+                + [DirichletBC(V_b.sub(2), zero_scalar, bmf_b, side)
+                   for side in (1, 2, 4)])
+
+        # eta(0)=0 exactly. Project xi(0)=pi*(-3x+cos(y),y+1)
+        # with the solid elasticity form and its exact exterior trace.
+        Qksi = ksi_old.function_space()
+        ksi_r = TrialFunction(Qksi)
+        ksi_test = TestFunction(Qksi)
+        bc_ksi0 = [DirichletBC(Qksi, ksi_bc, bmf_b, side)
+                   for side in (1, 2, 4)]
+        a_ksi0 = (2.0*mu_b*inner(epsilon(ksi_r), epsilon(ksi_test))
+                  + lambda_b*div(ksi_r)*div(ksi_test))*dx(domain=mesh_b)
+        L_ksi0 = (2.0*mu_b*inner(epsilon(ksi_D), epsilon(ksi_test))
+                  + lambda_b*div(ksi_D)*div(ksi_test))*dx(domain=mesh_b)
+        solve(a_ksi0 == L_ksi0, ksi_old, bc_ksi0,
+              solver_parameters={"linear_solver": "umfpack"})
+
+        # Ritz-project phi(0)=sin(pi*x)*cos(pi*y/2), which is zero on the
+        # exterior sides and has zero normal derivative at the interface.
+        Qphi = phi_old.function_space()
+        phi_r = TrialFunction(Qphi)
+        phi_test = TestFunction(Qphi)
+        bc_phi0 = [DirichletBC(Qphi, zero_scalar, bmf_b, side)
+                   for side in (1, 2, 4)]
+        a_phi0 = K*dot(grad(phi_r), grad(phi_test))*dx(domain=mesh_b)
+        L_phi0 = K*dot(grad(phi_D), grad(phi_test))*dx(domain=mesh_b)
+        solve(a_phi0 == L_phi0, phi_old, bc_phi0,
+              solver_parameters={"linear_solver": "umfpack"})
+        if "--smoke" in sys.argv:
+            phi0_error = phi_D - phi_old
+            print("[rank1] initial pore-pressure Ritz errors: "
+                  f"L2={np.sqrt(assemble(phi0_error*phi0_error*dx(domain=mesh_b))):.6e}, "
+                  f"H1-seminorm={np.sqrt(assemble(dot(grad(phi0_error), grad(phi0_error))*dx(domain=mesh_b))):.6e}",
+                  flush=True)
+
+        # constants
+        rhoB = Constant(rho_b)
+        muB  = Constant(mu_b)
+        lamB = Constant(lambda_b)
+        Alp  = Constant(alpha)
+        C0c  = Constant(C0)
+        Kc   = Constant(K)
+        Cbjs = Constant(C_BJS)
+
+        # BE Biot forms 
+        a_be = rhoB*dot(ksi, zeta)*dx \
+             + 2*dt*muB*inner(epsilon(eta), epsilon(zeta))*dx \
+             + dt*lamB*div(eta)*div(zeta)*dx \
+             - dt*Alp*phi*div(zeta)*dx \
+             + dt*dot(ksi, vp)*dx \
+             - dot(eta, vp)*dx \
+             + dt*dot(ksi, n_b)*dot(zeta, n_b)*ds_b(5) \
+             + dt*Cbjs*dot(ksi, tor_b)*dot(zeta, tor_b)*ds_b(5) \
+             + dt*phi*dot(zeta, n_b)*ds_b(5)
+
+        L_be = rhoB*dot(ksi_old, zeta)*dx \
+             - dot(eta_old, vp)*dx \
+             + dt*dot(f_e, zeta)*dx \
+             + dt*Cbjs*dot(u_old, tor_b)*dot(zeta, tor_b)*ds_b(5) \
+             + dt*dot(ksi_old, n_b)*dot(zeta, n_b)*ds_b(5)
+
+        a_bp = C0c*phi*psi*dx \
+             + dt*Alp*div(ksi)*psi*dx \
+             + dt*Kc*dot(grad(phi), grad(psi))*dx \
+             + dt*phi*psi*ds_b(5) \
+             - dt*dot(ksi, n_b)*psi*ds_b(5)
+
+        L_bp = dt*f_p*psi*dx \
+             + C0c*phi_old*psi*dx \
+             - dt*dot(u_old, n_b)*psi*ds_b(5) \
+             + dt*phi_old*psi*ds_b(5)
+
+        a_b = a_be + a_bp
+        L_b = L_be + L_bp
+
+        A_b = assemble(a_b)
+        for bc in bc_b:
+            bc.apply(A_b)
+        solver_b = LUSolver(A_b, "umfpack")
+
+        # MPI buffers
+        recv_u = np.zeros(u_old.vector().local_size(), dtype=np.float64)
+        send_eta = np.zeros(eta_old.vector().local_size(), dtype=np.float64)
+        send_ksi = np.zeros(ksi_old.vector().local_size(), dtype=np.float64)
+        send_phi = np.zeros(phi_old.vector().local_size(), dtype=np.float64)
+
+        for nstep in range(nsteps):
+            t = (nstep + 1)*dt_float
+
+            # blocking exchange: recv u^n, send (eta^n,ksi^n,phi^n)
+            comm.Recv(recv_u, source=0, tag=10)
+            u_old.vector()[:] = recv_u
+            u_old.set_allow_extrapolation(True)
+
+            send_eta[:] = eta_old.vector().get_local()
+            send_ksi[:] = ksi_old.vector().get_local()
+            send_phi[:] = phi_old.vector().get_local()
+            comm.Send(send_eta, dest=0, tag=20)
+            comm.Send(send_ksi, dest=0, tag=21)
+            comm.Send(send_phi, dest=0, tag=22)
+
+            time_b.assign(t)
+            eta_bc.A = float(np.sin(np.pi*t))
+            ksi_bc.A = float(np.pi*np.cos(np.pi*t))
+
+            b_b = assemble(L_b)
+            for bc in bc_b:
+                bc.apply(b_b)
+            solver_b.solve(Biot_present.vector(), b_b)
+            eta_fem, ksi_fem, phi_fem = Biot_present.split(True)
+
+            eta_old.assign(eta_fem)
+            ksi_old.assign(ksi_fem)
+            phi_old.assign(phi_fem)
+
+        eta_error = eta_fem - eta_D
+        ee = (np.sqrt(assemble(inner(epsilon(eta_error), epsilon(eta_error))
+                               * dx(domain=mesh_b)))
+              + np.sqrt(assemble(div(eta_error)**2 * dx(domain=mesh_b))))
+        ek = np.sqrt(assemble(dot(ksi_D - ksi_fem, ksi_D - ksi_fem)*dx(domain=mesh_b)))
+        eph = np.sqrt(assemble((phi_D - phi_fem)*(phi_D - phi_fem)*dx(domain=mesh_b)))
+
+        # wait for end-of-case signal and return errors
+        flag = np.empty(1, dtype=np.int32)
+        comm.Recv(flag, source=0, tag=98)
+        comm.Send(np.array([ee, ek, eph], dtype=np.float64), dest=0, tag=77)
+        return None
+
+# ----------------------
+# Sweep schedules
+# ----------------------
+def temporal_sweep(n_list, phi_degree, fixed_nm, dry_run=False):
+    # Hold the mesh fixed; n changes only the time step.
+    T = 0.25
+    dx_float = 1/(fixed_nm)
+
+    if dry_run:
+        if rank == 0:
+            print(f"Temporal schedule at T={T:g}, {fixed_nm} intervals/side")
+            print(f"{'n':>5} {'dt':>14} {'dx':>14} {'steps':>14}")
+            for n in n_list:
+                print(f"{n:5d} {0.05/n:14.6e} {dx_float:14.6e} {5*n:14d}")
+        return
+
+    rows = []
+    for n in n_list:
+        dt_float = 0.05/n
+        errors = solve_case(dt_float, fixed_nm, T, phi_degree)
+        if rank == 0:
+            eu, ep, ee, ek, eph = errors
+            rows.append((n, dt_float, dx_float, ee, ek, eph, eu, ep))
+            print(f"[rank0] temporal n={n}: dt={dt_float:.6e}, dx={dx_float:.6e}, "
+                  f"eta={ee:.6e}, xi={ek:.6e}, phi={eph:.6e}, "
+                  f"u={eu:.6e}, p={ep:.6e}", flush=True)
+    print_table(f"Temporal refinement at T={T:g}, fixed dx={dx_float:g} "
+                f"({fixed_nm} intervals/side, phi P{phi_degree})",
+                rows, is_dt=True)
+
+def build_spatial_cases(n_list, base_dt, reference_n=4, dt_power=0,
+                        dt_scale=1.0, T=1e-5):
+    """Plan dx=0.5/n and a fixed dt by default, with an exact common end time.
+
+    Rational arithmetic avoids adding a step because of floating-point
+    rounding. Ceil(T/dt_target) makes the actual dt no larger than requested.
+    The reference n is explicit, so selecting a subset does not change its dt.
+    """
+    if not n_list or any(n < 1 for n in n_list):
+        raise ValueError("Spatial refinement parameters must be positive")
+    if any(left >= right for left, right in zip(n_list, n_list[1:])):
+        raise ValueError("Spatial refinement parameters must be strictly increasing")
+    if reference_n < 1 or dt_power < 0:
+        raise ValueError("The spatial reference n must be positive and the time-step power nonnegative")
+    if any(not math.isfinite(value) or value <= 0.0
+           for value in (base_dt, dt_scale, T)):
+        raise ValueError("The base time step, time-step scale and final time must be positive and finite")
+
+    end_time = Fraction(str(T))
+    base_step = Fraction(str(base_dt))*Fraction(str(dt_scale))
+    cases = []
+    for n in n_list:
+        target_step = base_step*Fraction(reference_n, n)**dt_power
+        requested_steps = end_time/target_step
+        nsteps = ((requested_steps.numerator + requested_steps.denominator - 1)
+                  // requested_steps.denominator)
+        dt_float = float(end_time/nsteps)
+        cases.append((n, 2*n, dt_float, 0.5/n, nsteps))
+    return cases
+
+
+def spatial_sweep(n_list, phi_degree, base_dt, reference_n=4, dt_power=0,
+                  dt_scales=(1.0,), T=1e-5, dry_run=False):
+    # The default power=0 keeps dt fixed; rates are computed using dx.
+    for dt_scale in dt_scales:
+        cases = build_spatial_cases(n_list, base_dt, reference_n,
+                                    dt_power, dt_scale, T)
+        time_schedule = (f"{base_dt*dt_scale:g}" if dt_power == 0
+                         else f"{base_dt*dt_scale*reference_n:g}/n" if dt_power == 1
+                         else f"{base_dt*dt_scale:g}*({reference_n}/n)^{dt_power}")
+        title = (f"Spatial refinement at T={T:g}, dx=0.5/n, "
+                 f"dt_target={time_schedule} "
+                 f"(phi P{phi_degree}, dt scale={dt_scale:g})")
+        if rank == 0:
+            print("\n" + title, flush=True)
+            print(f"{'n':>5} {'intervals':>10} {'dt':>14} {'dx':>14} {'steps':>14}", flush=True)
+            for n, nm, dt_float, dx_float, nsteps in cases:
+                print(f"{n:5d} {nm:10d} {dt_float:14.6e} {dx_float:14.6e} {nsteps:14d}", flush=True)
+        if dry_run:
+            continue
+
+        rows = []
+        for n, nm, dt_float, dx_float, nsteps in cases:
+            errors = solve_case(dt_float, nm, T, phi_degree)
+            if rank == 0:
+                eu, ep, ee, ek, eph = errors
+                rows.append((n, dt_float, dx_float, ee, ek, eph, eu, ep))
+                print(f"[rank0] spatial n={n}, intervals={nm}, steps={nsteps}: "
+                      f"dt={dt_float:.6e}, dx={dx_float:.6e}, "
+                      f"eta={ee:.6e}, xi={ek:.6e}, phi={eph:.6e}, "
+                      f"u={eu:.6e}, p={ep:.6e}", flush=True)
+        print_table(title, rows, is_dt=False)
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Two-rank Stokes--Biot convergence sweeps")
+    parser.add_argument("--mode", choices=("both", "temporal", "spatial"),
+                        default="spatial", help="Select which convergence sweep to run (default: spatial)")
+    parser.add_argument("--temporal-n", nargs="+", type=int,
+                        default=[4, 8, 16, 32, 64, 128])
+    parser.add_argument("--spatial-n", nargs="+", type=int,
+                        default=[4, 8, 16, 32, 64, 128])
+    parser.add_argument("--temporal-mesh-intervals", type=int, default=100,
+                        help="Fixed intervals per side in the temporal sweep (default: 100; dx=0.01)")
+    parser.add_argument("--spatial-dt", type=float, default=1e-7,
+                        help="Time step for the spatial sweep (default: 1e-7 on every mesh)")
+    parser.add_argument("--spatial-reference-n", type=int, default=4,
+                        help="Reference n for a mesh-dependent time step when --spatial-dt-power is positive (default: 4)")
+    parser.add_argument("--spatial-dt-power", type=int, choices=(0, 1, 2, 3, 4), default=0,
+                        help="Time step scales as (reference_n/n)^power; default 0 keeps it fixed")
+    parser.add_argument("--spatial-dt-scales", nargs="+", type=float, default=[1.0],
+                        help="Repeat spatial sweeps with these base-dt multipliers; use 1 0.5 to check time-error contamination")
+    parser.add_argument("--spatial-final-time", type=float, default=1e-5,
+                        help="Common final time for all spatial cases (default: 1e-5)")
+    parser.add_argument("--phi-degree", type=int, choices=(1, 2), default=1,
+                        help="Pore-pressure degree: P1 in the numerical section, P2 for the theorem")
+    parser.add_argument("--smoke", action="store_true", help="Run two short steps")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Print discretization schedules and step counts without solving")
+    args = parser.parse_args()
+    if any(n < 1 for n in args.temporal_n + args.spatial_n):
+        parser.error("All refinement parameters must be positive integers")
+    if args.temporal_mesh_intervals < 1:
+        parser.error("--temporal-mesh-intervals must be a positive integer")
+    if args.smoke and args.dry_run:
+        parser.error("--smoke and --dry-run cannot be used together")
+    if args.mode in ("both", "spatial") and not args.smoke:
+        try:
+            for dt_scale in args.spatial_dt_scales:
+                build_spatial_cases(args.spatial_n, args.spatial_dt,
+                                    args.spatial_reference_n, args.spatial_dt_power,
+                                    dt_scale, args.spatial_final_time)
+        except ValueError as exc:
+            parser.error(str(exc))
+
+    if rank == 0:
+        print("[rank0] BE sweep starting", flush=True)
+    else:
+        print("[rank1] BE sweep starting", flush=True)
+
+    if args.smoke:
+        result = solve_case(0.05, 8, 0.1, args.phi_degree)
+        if rank == 0:
+            print("[rank0] smoke errors (u, p, eta, ksi, phi):", result, flush=True)
+    else:
+        if args.mode in ("both", "temporal"):
+            temporal_sweep(args.temporal_n, args.phi_degree,
+                           args.temporal_mesh_intervals, args.dry_run)
+        if args.mode in ("both", "spatial"):
+            comm.Barrier()
+            spatial_sweep(args.spatial_n, args.phi_degree, args.spatial_dt,
+                          args.spatial_reference_n, args.spatial_dt_power,
+                          args.spatial_dt_scales, args.spatial_final_time,
+                          args.dry_run)
+    comm.Barrier()
+
+    if rank == 0:
+        print("[rank0] " + ("Schedule preview complete" if args.dry_run else "BE sweep done"), flush=True)
+    else:
+        print("[rank1] BE sweep done", flush=True)

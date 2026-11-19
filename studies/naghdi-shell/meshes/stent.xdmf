@@ -1,0 +1,14 @@
+<?xml version="1.0"?>
+<!DOCTYPE Xdmf SYSTEM "Xdmf.dtd" []>
+<Xdmf Version="3.0">
+  <Domain>
+    <Grid Name="mesh" GridType="Uniform">
+      <Topology TopologyType="Triangle" NumberOfElements="3840">
+        <DataItem Format="HDF" DataType="Int" Dimensions="3840 3">stent.h5:/data1</DataItem>
+      </Topology>
+      <Geometry GeometryType="XY">
+        <DataItem Format="HDF" NumberType="Float" Precision="8" Dimensions="2013 2">stent.h5:/data0</DataItem>
+      </Geometry>
+    </Grid>
+  </Domain>
+</Xdmf>

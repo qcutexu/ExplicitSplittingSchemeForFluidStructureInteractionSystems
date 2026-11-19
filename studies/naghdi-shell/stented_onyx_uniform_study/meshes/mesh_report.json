@@ -1,0 +1,37 @@
+{
+  "geometry": {
+    "R_ref": 0.0015,
+    "R0": 0.0015,
+    "width": 0.033,
+    "stent_start": 0.006,
+    "stent_end": 0.027,
+    "stenosis_depth": 0.0,
+    "stenosis_center": 0.0165,
+    "stenosis_width": 0.004,
+    "strut_height": 8.1e-05,
+    "strut_width": 6.5e-05,
+    "axial_cells": 8,
+    "circumferential_repeats": 8,
+    "helical_turns": 0.35,
+    "window_eps": 0.00045,
+    "profile_sharpness": 2.5
+  },
+  "x_shift": -0.008,
+  "common_surface": "inward radial graph",
+  "material_regions": {
+    "1": "vessel wall",
+    "2": "connected strut bands"
+  },
+  "strut_half_width_m": 6.5e-05,
+  "steel_network_components": 1,
+  "shell_vertices": 10705,
+  "shell_triangles": 21032,
+  "fluid_vertices": 30620,
+  "fluid_tetrahedra": 156320,
+  "maximum_interface_coordinate_defect_m": 4.854175174822074e-16,
+  "steel_triangles": 5177,
+  "mesh_sizes": {
+    "strut": 0.00016,
+    "wall": 0.00032
+  }
+}
