@@ -10,4 +10,4 @@
 
 The Naghdi split drivers in the corrected-wall snapshot classify fluid exterior facets by midpoint. Use that snapshot for new unstented comparisons. The source collection also contains historical runs, logs, manuscripts, and machine-specific plotting and rerun pipelines. These remain in the original folders. The included guides cover running the selected examples and inspecting newly generated data. Historical figure layouts depend on the plotting pipelines and inputs retained in the original folders.
 
-The Stokes–Biot launchers and benchmark driver use the active environment in place of machine-specific interpreter paths. The working files retain the original numerical methods. No distribution license has been selected.
+The Stokes–Biot launchers and benchmark driver use the active environment in place of machine-specific interpreter paths. The working files retain the original numerical methods.

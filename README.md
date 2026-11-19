@@ -11,3 +11,7 @@ Research drivers for fluid–structure interaction (FSI) and fluid–poroelastic
 | [FPSI error estimates](studies/fpsi-error-estimates/README.md) | Backward Euler and BDF2/AB2 examples, including ALE blood-flow drivers |
 
 Start with [environment setup and verification](docs/setup.md). Run commands from the study directory shown in each guide. See [source provenance](docs/provenance.md) for the source folders, version choices, and reproduction scope.
+
+## License
+
+This project is available under the [MIT License](LICENSE).
